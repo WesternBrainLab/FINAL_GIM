@@ -1,0 +1,17 @@
+# Python bytecode and local interpreter caches
+__pycache__/
+*.py[cod]
+
+# Local environments and editor settings
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+.DS_Store
+
+# Generated analysis outputs and logs
+output/
+outputs/
+results/
+*.log

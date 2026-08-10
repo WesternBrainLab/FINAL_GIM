@@ -1,28 +1,25 @@
 import numpy as np
-import os
 from scipy.stats import pearsonr
-from scipy.stats import kstest
-import matplotlib as mpl
+from scipy.stats import ks_2samp
 import matplotlib.pyplot as plt
 import random
-# Support both package imports (``steven.Scripts.ising3``) and running this
-# legacy module directly from the Scripts directory.
-try:
-    from . import utils
-    from . import config as cf
-except ImportError:  # pragma: no cover - retained for direct script use
-    import utils
-    import config as cf
+import CONFIG as C
+import UTILS as utils
 import time
-import pickle
 from abc import ABC, abstractmethod
 from matplotlib.colors import TwoSlopeNorm
-from pathlib import Path
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-# Saved simulation logs and pickles are intermediate data, not final figures.
-DEFAULT_ISING_DATA_DIR = PROJECT_DIR / "DATA" / "simulation data" / "ising data"
+# ── Shared data loaded once at import time ────────────────────────────────
+# avg_Jij and avg_FCp are used as defaults so callers that don't pass
+# explicit matrices still get sensible behaviour.
+_avg_Jij = utils.load_csv(C.JIJ_PROCESSED_PATH).astype(float)
+_avg_FC1  = utils.load_csv(C.FC1_PATH).astype(float)
+_avg_FC2  = utils.load_csv(C.FC2_PATH).astype(float)
+_avg_FC3  = utils.load_csv(C.FC3_PATH).astype(float)
+avg_Jij   = _avg_Jij
+avg_FC    = utils.average_matrices(_avg_FC1, _avg_FC2, _avg_FC3)
+regions   = avg_Jij.shape[0]
 
 
 '''
@@ -101,6 +98,8 @@ class Spins:
         self.total_energy = self.hamiltonian()
         self.mag = self.magnetization()
 
+# Energy and Magnetization functions are defined here
+
     def energy(self, i, j):
         '''
         Calculate the energy between neurons i and j, defined as the negative Jij value corresponding to the two
@@ -153,6 +152,8 @@ class Spins:
         else:
             return -np.sum(self.Jij * (self.spins * self.spins.reshape((np.size(self.spins), 1))))
 
+# System Updates
+
     def update(self, index, energy = None):
         '''
         Update the system by changing the spins of a given set of neurons, and recalculating the system energy.
@@ -176,7 +177,7 @@ class Ising(ABC):
     This class is used as the base structure for implementations of the Ising model.
     '''
 
-    def __init__(self, temp, Jij = cf.avg_Jij, spin_ar = None, directed = False):
+    def __init__(self, temp, Jij = avg_Jij, spin_ar = None, directed = False):
         '''
         Initialize simulation parameters. System energy and magnetization is stored per timestep of the simulation in
         arrays. A timer variable is also defined to measure how long the simulation takes.
@@ -297,6 +298,20 @@ class Ising(ABC):
 
         return self.functional_connectivity
 
+    # For partial correlation, if the ridge value is too small, the matrix inversion can fail.
+    # This function tries a series of ridge values until it succeeds, or returns a zero matrix if all fail.
+    def _partial_fc_with_fallback(self) -> np.ndarray:
+        """Try increasing ridge values until part_corr succeeds."""
+        for ridge in (1e-8, 1e-6, 1e-4, 1e-2):
+            try:
+                return utils.part_corr(self.spin_series, ridge=ridge)
+            except ValueError:
+                continue
+        # All ridge values failed — return a zero matrix
+        n = self.spin_series.shape[0]
+        return np.zeros((n, n))
+
+
     def susceptibility(self, beta):
         '''
         Finds the susceptibility of the system after simulation. This measures how volatile the system is, with a high
@@ -325,7 +340,7 @@ class Ising(ABC):
         e = np.asarray(self.energy_series, dtype=float)
         return (beta ** 2) * np.var(e) / self.spin.size
 
-    def correlation(self, emp_FC = cf.avg_FC, diag = False):
+    def correlation(self, emp_FC = avg_FC, diag = False):
         '''
         Calculates the correlation between the simulated and empirical functional connectivity matrices.
 
@@ -360,15 +375,18 @@ class Ising(ABC):
         return 0.0 if not np.isfinite(r) else float(r)
 
     def distance(self):
-        avg_TS_1 = utils.get_matrix('avg_TS_1')
-        avg_TS_2 = utils.get_matrix('avg_TS_2')
-        avg_TS_3 = utils.get_matrix('avg_TS_3')
-
-        dist_1 = kstest(self.spin_series, avg_TS_1).statistic
-        dist_2 = kstest(self.spin_series, avg_TS_2).statistic
-        dist_3 = kstest(self.spin_series, avg_TS_3).statistic
-        avg_dist = np.mean([dist_1, dist_2, dist_3])
-        return avg_dist
+        """Return mean two-sample KS distance from the three empirical TS sets."""
+        simulated = np.asarray(self.spin_series, dtype=float).ravel()
+        distances = []
+        for folder in C.TS_SUBFOLDERS:
+            directory = C.TS_DATA_DIR / folder
+            for file_path in directory.iterdir():
+                if file_path.is_file():
+                    empirical = utils.get_matrix(file_path.name, directory)
+                    distances.append(ks_2samp(simulated, empirical.ravel()).statistic)
+        if not distances:
+            raise FileNotFoundError("No empirical time-series files found for KS distance.")
+        return float(np.mean(distances))
     
 
 
@@ -378,10 +396,10 @@ class get_data:
     visualization of parameters.
     '''
 
-    def __init__(self, ising, beta, T_global, alpha, emp_FC = cf.avg_FCp, diag = False, save = False, save_dir = None):
+    def __init__(self, ising, beta, T_global, alpha, emp_FC = avg_FC, diag = False):
         '''
-        Initializes parameters and stores a log of simulation data. Optionally, the class allows the user to save the
-        simulation log, along with graphs of time series data acquired during the simulation.
+        Initializes parameters and stores simulation data for the calling
+        script to graph or save.
 
         :param ising: Ising class object post simulation.
 
@@ -395,7 +413,6 @@ class get_data:
 
         :param diag: If False, calculates the correlation without the diagonal values of each matrix.
 
-        :param save: If True, saves the simulation log and graphs of simulation data.
         '''
 
         self.ising = ising
@@ -405,8 +422,6 @@ class get_data:
         self.beta = beta
         self.T_global = T_global
         self.alpha = alpha
-        self.save = save
-
         self.partial = ising.partial
         self.time = ising.timer
         self.correlation = ising.correlation(self.emp_FC, diag)
@@ -423,25 +438,12 @@ class get_data:
                   f'susceptibility: {self.suscept}\n' \
                   f'specific heat: {self.spec_heat}'
 
-        if save:
-            save_root = Path(save_dir) if save_dir is not None else DEFAULT_ISING_DATA_DIR
-            save_root.mkdir(parents=True, exist_ok=True)
-            num_folders = len(next(os.walk(save_root))[1])
-            self.folder_name = 'ising_simulation_run_' + str(num_folders)
-            self.path = save_root / self.folder_name
-            os.mkdir(self.path)
-
-            with open(self.path / 'log.txt', 'w') as dir:
-                dir.write(self.message)
-
-            pickle.dump(self.ising, open(self.path / 'ising.pickle', 'wb'))
-
     def __str__(self):
         return self.message
 
 class default_ising(Ising):
 
-    def __init__(self, temp, Jij = cf.avg_Jij, spin_ar = None):
+    def __init__(self, temp, Jij = avg_Jij, spin_ar = None):
         super().__init__(temp, Jij, spin_ar)
         self.index = np.arange(self.spin.size)
 
@@ -458,7 +460,7 @@ class default_ising(Ising):
 
 class Jij_sorted_ising(Ising):
 
-    def __init__(self, temp, Jij = cf.avg_Jij, directed = False, spin_ar = None):
+    def __init__(self, temp, Jij = avg_Jij, directed = False, spin_ar = None):
         super().__init__(temp, Jij, spin_ar, directed)
         ind_avg_Jij = np.mean(Jij, 0)
         self.index = utils.cross_sort(ind_avg_Jij)
@@ -475,7 +477,7 @@ class Jij_sorted_ising(Ising):
 
 class random_ising(Ising):
 
-    def __init__(self, temp, Jij = cf.avg_Jij, spin_ar = None, directed = False, num_index = None):
+    def __init__(self, temp, Jij = avg_Jij, spin_ar = None, directed = False, num_index = None):
         super().__init__(temp, Jij, spin_ar, directed)
         if num_index is None:
             self.num_index = np.shape(Jij)[0]
@@ -486,25 +488,25 @@ class random_ising(Ising):
         return f'random Ising with num_index = {self.num_index}'
 
     def time_scale(self):
-        random_index = np.random.choice(cf.regions, size = self.num_index)
+        random_index = np.random.choice(regions, size = self.num_index)
         for i in random_index:
             dE = self.metropolis_step(i)
             if dE is not None:
                 self.spin.update(i, dE)
 
 
-if __name__ == '__main__':
-    t_global = 8 #8.15
-    alpha = 2.07 # 2.07
-    temp = t_global * (cf.norm_ind_avg_Jij ** alpha)
-    beta = 1 / np.mean(temp)
-    steps = 3000
-    Jij = cf.avg_Jij
+#  Helper used by TEMP_SWEEP.py to construct a get_data object with the same
+#  as the original I.get_data() call.
 
-    simulation = random_ising(temp, Jij = Jij)
-    simulation.simulate(steps, 1000)
-    simulation.generate_FC(True)
-    plt.matshow(simulation.functional_connectivity)
-    plt.show()
+def build_get_data(
+    ising:    Ising,
+    beta:     float,
+    T_global: float,
+    alpha:    float,
+    emp_FC:   np.ndarray = avg_FC,
+    diag:     bool = False,
+) -> get_data:
+    """Convenience constructor — mirrors the original I.get_data() call pattern."""
+    return get_data(ising, beta, T_global, alpha, emp_FC=emp_FC, diag=diag)
 
-    data = get_data(simulation, beta, t_global, alpha, emp_FC = cf.avg_FCp, save = False)
+    data = get_data(simulation, beta, t_global, alpha, emp_FC = avg_FC, save = False)

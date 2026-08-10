@@ -1,110 +1,36 @@
-import os
-import numpy as np
-import pandas as pd
+"""
+UTILS.py — Shared helper functions and Jij sign-correction pipeline.
 
-import scipy as sp
-from concurrent.futures import ThreadPoolExecutor
-import pickle
-import time
-
-"""Shared data configuration for the FINAL_GIM analysis pipeline.
-
-This module performs no simulations.  Its job is to load the matrices used by
-the other analysis scripts once, calculate a few useful network-level
-summaries, and expose them under descriptive names.  Keeping these values in
-one place avoids each script loading a different version of the data.
-
-The arrays loaded here are all 84 × 84 connectivity matrices.  Rows and
-columns refer to the same brain-region ordering, so matrices must remain
-aligned before they are compared with simulated functional connectivity.
-
-Planned consolidation: these definitions can later be moved into UTILS.py.
-If that happens, update dependent imports at the same time, rather than
-copying the code into both files; otherwise two configurations could drift.
+When imported: provides pure utility functions with no side effects.
+When run directly (__main__): builds sign-corrected per-subject Jij matrices
+and saves them under DATA/thresholded_Jij_pearson/.
 """
 
+from __future__ import annotations
+
+import os
+import pickle
 from pathlib import Path
 
-# ``config`` is imported by ``steven.Scripts.ising3`` as part of the package,
-# but this fallback preserves direct execution from this directory.
-try:
-    from . import utils
-except ImportError:  # pragma: no cover - retained for direct script use
-    import utils
 import numpy as np
-import os
+import pandas as pd
+import scipy as sp
 
-# FINAL_GIM/CONFIG.py -> FINAL_GIM/DATA.  Using ``resolve`` makes this work
-# regardless of the terminal directory from which a script is launched.
-DATA_DIR = Path(__file__).resolve().parent / "DATA"
+import CONFIG as C
 
+# ── Path constants (Jij build pipeline) ───────────────────────────────────
+JIJ_RAW_DIR     = C.DATA_DIR / "Jij data_raw"
+JIJ_RAW_PATTERN = "Jij_{}.csv"
+JIJ_NEW_DIR     = C.DATA_DIR / "thresholded_Jij_pearson"
+AVG_JIJ_NEW_PATH = JIJ_NEW_DIR / "avg_thresholded_Jij_pearson.csv"
 
-def get_data_matrix(relative_path):
-    """Load one comma-delimited matrix from FINAL_GIM/DATA.
-
-    ``relative_path`` is deliberately relative to ``DATA_DIR`` (for example,
-    ``'FC data_processed/avg_TS_1'``), so callers do not need to hard-code
-    machine-specific absolute paths.
-    """
-    return utils.get_matrix(relative_path, directory=DATA_DIR)
-
-# ── Structural connectivity used by the Ising model ──────────────────────
-# ``avg_Jij`` is the group-average structural coupling matrix after removing
-# outliers and normalizing its scale.  Ising simulations use it as Jij: a
-# positive/negative value determines how strongly two regions influence each
-# other's spin states.  ``regions`` is the number of model nodes and should
-# match every FC matrix loaded below.
-avg_Jij = get_data_matrix('Jij data_processed/avg_Jij_no_outliers_norm')
-regions = np.shape(avg_Jij)[0]
-
-# ── Empirical functional-connectivity (FC) reference matrices ────────────
-# Each ``FC_n`` is a Pearson-correlation FC matrix from one recording/session
-# group. ``avg_FC`` is their elementwise mean and is the usual empirical
-# reference when judging a simulated FC matrix.
-#
-# Filename suffixes:
-#   p  = partial-correlation FC (relationship after controlling other nodes)
-#   b  = binarized FC
-#   pb = binarized partial-correlation FC
-# The unsuffixed matrices below are standard Pearson FC values.
-FC_1p, FC_2p, FC_3p = get_data_matrix('FC data_processed/avg_TS_1p'), \
-                      get_data_matrix('FC data_processed/avg_TS_2p'), \
-                      get_data_matrix('FC data_processed/avg_TS_3p')
-# Group-average partial-correlation FC.
-avg_FCp = utils.average_matrices(FC_1p, FC_2p, FC_3p)
-
-FC_1, FC_2, FC_3 = get_data_matrix('FC data_processed/avg_TS_1'), \
-                   get_data_matrix('FC data_processed/avg_TS_2'), \
-                   get_data_matrix('FC data_processed/avg_TS_3')
-avg_FC = utils.average_matrices(FC_1, FC_2, FC_3)
-
-FC_1pb, FC_2pb, FC_3pb = get_data_matrix('FC data_processed/avg_TS_1pb'), \
-                         get_data_matrix('FC data_processed/avg_TS_2pb'), \
-                         get_data_matrix('FC data_processed/avg_TS_3pb')
-avg_FCpb = utils.average_matrices(FC_1pb, FC_2pb, FC_3pb)
-
-# ── Per-region summaries used for heterogeneous temperatures ─────────────
-# The mean of each *column* measures a region's average connectivity to all
-# other regions.  ``ind_avg_Jij`` is derived from the structural matrix and
-# is commonly normalized before using it as a per-region temperature
-# multiplier.  ``ind_avg_FC`` is the corresponding empirical FC summary.
-ind_avg_Jij = np.mean(avg_Jij, 0)
-norm_ind_avg_Jij = utils.normalize_array(ind_avg_Jij)
-ind_avg_FC = np.mean(avg_FC, 0)
-
-# Sorted copies are intended for distribution/rank plots.  ``ndarray.sort``
-# sorts ascending in place; these are therefore least-connected to
-# most-connected, despite legacy names that do not state the direction.
-sort_ind_avg_FC = ind_avg_FC.copy()
-sort_ind_avg_FC.sort()
-sort_ind_avg_Jij = ind_avg_Jij.copy()
-sort_ind_avg_Jij.sort()
+SUBJECT_IDS = list(range(2, 26))   # subjects 2 – 25 (24 total)
+SEED        = C.SEED
 
 
-
- # This module contains helper functions 
- # When running UTILS.py, thresholded jij is saved to DATA folder.
-
+# ═══════════════════════════════════════════════════════════════════════════
+# I/O HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
 
 def get_folder(folder_name, directory = os.path.dirname(__file__)):
     current_directory = directory
@@ -135,8 +61,24 @@ def matrix_from_dir(directory):
     return np.array(matrix_ar)
 
 
-def minmax_norm(array):
-    return (array - np.min(array)) / (np.max(array) - np.min(array))
+def load_csv(path: str | Path) -> np.ndarray:
+    """Thin wrapper: load a CSV as a float64 array."""
+    return np.genfromtxt(path, delimiter=",", dtype=float)
+
+
+def save_csv(matrix: np.ndarray, path: str | Path) -> None:
+    """Save *matrix* as CSV; creates parent directories if needed."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(matrix).to_csv(path, index=False, header=False)
+
+
+def get_pickle_file(directory, file_name):
+    directory = directory + '/' + file_name
+    with open(directory, 'rb') as picklefile:
+        return pickle.load(picklefile)
+
+
 
 
 def df_to_text(data, directory, file_name):
@@ -144,6 +86,79 @@ def df_to_text(data, directory, file_name):
     with open(path, 'w') as file:
         data_string = data.to_string()
         file.write(data_string)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ARRAY UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def normalize_array(array):
+    return array / np.max(np.abs(array))
+
+
+def minmax_norm(array):
+    return (array - np.min(array)) / (np.max(array) - np.min(array))
+
+def average_matrices(*arrays):
+    avg_ar = np.zeros(np.shape(arrays[0]))
+
+    for ar in arrays:
+        avg_ar += ar
+
+    avg_ar /= len(arrays)
+    return avg_ar
+
+
+
+def flat_remove_diag(array):
+    new_ar = []
+    length = range(np.shape(array)[0])
+    for y in length:
+        for x in length:
+            if x != y:
+                new_ar.append(array[y, x])
+    return np.array(new_ar)
+
+
+def average_series(series):
+    return np.cumsum(series) / (np.arange(np.size(series)) + 1)
+
+def percent_error(actual, expected):
+    return np.abs((actual - expected) / expected)
+
+
+def cross_sort(sort_array, *args, hi_lo = True):
+    if hi_lo:
+        copy_array = np.sort(np.unique(sort_array))[::-1]
+    else:
+        copy_array = np.sort(np.unique(sort_array))
+
+    index = []
+    for i in copy_array:
+        current_index = np.where(sort_array == i)[0]
+        if np.size(current_index) > 1:
+            for j in current_index:
+                index.append(j)
+        else:
+            index.append(current_index[0])
+    if args:
+        return args[index]
+    return index
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MATRIX OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def threshold_matrix(matrix, threshold):
+    matrix_copy = matrix.copy() / np.max(np.abs(matrix))
+    thresh_mat = np.ones(np.shape(matrix_copy))
+    thresh_mat[abs(matrix_copy) < threshold] = 0
+    thresh_mat[abs(matrix_copy) >= threshold] = 1
+    matrix_copy = matrix_copy * thresh_mat
+    matrix_copy[matrix_copy >= 0] = 1
+    matrix_copy[matrix_copy < 0] = -1
+    return matrix_copy
 
 
 def part_corr(time_series, ridge=1e-8):
@@ -203,58 +218,6 @@ def part_corr(time_series, ridge=1e-8):
 
     return partial_corr
 
-
-def normalize_array(array):
-    return array / np.max(np.abs(array))
-
-
-def cross_sort(sort_array, *args, hi_lo = True):
-    if hi_lo:
-        copy_array = np.sort(np.unique(sort_array))[::-1]
-    else:
-        copy_array = np.sort(np.unique(sort_array))
-
-    index = []
-    for i in copy_array:
-        current_index = np.where(sort_array == i)[0]
-        if np.size(current_index) > 1:
-            for j in current_index:
-                index.append(j)
-        else:
-            index.append(current_index[0])
-    if args:
-        return args[index]
-    return index
-
-
-def percent_error(actual, expected):
-    return np.abs((actual - expected) / expected)
-
-
-def average_matrices(*arrays):
-    avg_ar = np.zeros(np.shape(arrays[0]))
-
-    for ar in arrays:
-        avg_ar += ar
-
-    avg_ar /= len(arrays)
-    return avg_ar
-
-
-def flat_remove_diag(array):
-    new_ar = []
-    length = range(np.shape(array)[0])
-    for y in length:
-        for x in length:
-            if x != y:
-                new_ar.append(array[y, x])
-    return np.array(new_ar)
-
-
-def average_series(series):
-    return np.cumsum(series) / (np.arange(np.size(series)) + 1)
-
-
 def receiver_operating_characteristic(input_matrix, check_matrix):
     fpr_ar, tpr_ar = [0], [0]
 
@@ -282,187 +245,140 @@ def receiver_operating_characteristic(input_matrix, check_matrix):
     return tpr_ar, fpr_ar, sp.integrate.trapezoid(tpr_ar, x = fpr_ar)
 
 
-def get_pickle_file(directory, file_name):
-    directory = directory + '/' + file_name
-    with open(directory, 'rb') as picklefile:
-        return pickle.load(picklefile)
+# ═══════════════════════════════════════════════════════════════════════════
+# JIJ BUILD PIPELINE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def threshold_matrix(matrix, threshold):
-    matrix_copy = matrix.copy() / np.max(np.abs(matrix))
-    thresh_mat = np.ones(np.shape(matrix_copy))
-    thresh_mat[abs(matrix_copy) < threshold] = 0
-    thresh_mat[abs(matrix_copy) >= threshold] = 1
-    matrix_copy = matrix_copy * thresh_mat
-    matrix_copy[matrix_copy >= 0] = 1
-    matrix_copy[matrix_copy < 0] = -1
-    return matrix_copy
-
-# This is a directory path to the project folder. It is used to define paths to data and output directories.
-PROJECT_DIR = Path(__file__).resolve().parent
-DATA_ROOT = PROJECT_DIR / "DATA"
-PROJECT_DATA_DIR = DATA_ROOT
-
-JIJ_DIR = DATA_ROOT / "Jij data_raw"
-JIJ_PATTERN = "Jij_{}.csv"
-JIJ_NEW_DIR = PROJECT_DATA_DIR / "thresholded_Jij_pearson"
-AVG_JIJ_NEW_PATH = JIJ_NEW_DIR / "avg_thresholded_Jij_pearson.csv"
-
-FC1_PATH = DATA_ROOT / "FC data_processed" / "avg_TS_1"
-FC2_PATH = DATA_ROOT / "FC data_processed" / "avg_TS_2"
-FC3_PATH = DATA_ROOT / "FC data_processed" / "avg_TS_3"
-
-SUBJECT_IDS = list(range(2, 26))
-THRESHOLD = 0.0 # was 0.03
-SEED = 1
-
-
-# For each of the 25 subjects:
-#   1. Load Jij_initial_i
-#   2. Load the matching session Pearson FC (avg_TS_1 / avg_TS_2 / avg_TS_3)
-#   3. Apply threshold  →  Jij_new_i
-#   4. Save as csv →  thresholded_Jij_pearson_i.csv
-#
-# Then average all 25  →  avg_thresholded_Jij_pearson.csv
-#
-# Threshold rule (off-diagonal entries only):
-#   |Rho_ij| <  THRESHOLD  →  keep Jij_initial[i,j]               (structural sign)
-#   |Rho_ij| >= THRESHOLD  →  abs(Jij_initial[i,j]) * sign(Rho_ij) (empirical sign)
-#   diagonal               →  0
-
-# ── subject → session mapping ─────────────────────────────────────────────
-# Maps subject index (1-based) to session key.
-# Adjust if your subject-to-session assignment differs.
 def subject_session(s: int) -> str:
-    if s <= 9:   return "FC1"
-    if s <= 17:  return "FC2"
+    """Map subject index (1-based) to session key "FC1" | "FC2" | "FC3"."""
+    if s <= 9:  return "FC1"
+    if s <= 17: return "FC2"
     return "FC3"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════════════════════════════════
-
-def load_csv(path: str) -> np.ndarray:
-    return np.genfromtxt(path, delimiter=",", dtype=float)
-
-
-def save_csv(matrix: np.ndarray, path: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    pd.DataFrame(matrix).to_csv(path, index=False, header=False)
-
-
-def build_Jij_new(
-    Jij_initial: np.ndarray,
-    Rho_empirical: np.ndarray,
-    threshold: float,
+def build_jij_new(
+    jij_initial:   np.ndarray,
+    rho_empirical: np.ndarray,
+    threshold:     float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Sign-corrected Jij update using Pearson FC.
-    Returns (Jij_new, Rho_thresh).
+    Apply Pearson-FC sign correction to *jij_initial*.
+
+    Off-diagonal rule
+    -----------------
+    |Rho_ij| <  threshold → keep structural sign (Jij unchanged)
+    |Rho_ij| >= threshold → abs(Jij_ij) * sign(Rho_ij)
+    Diagonal              → 0
+
+    Returns (jij_new, rho_thresh).
     """
-    Jij       = Jij_initial.copy().astype(float)
-    Rho       = Rho_empirical.copy().astype(float)
-    N         = Jij.shape[0]
+    jij = jij_initial.copy().astype(float)
+    rho = rho_empirical.copy().astype(float)
+    n   = jij.shape[0]
 
-    Rho_thresh = Rho.copy()
-    Rho_thresh[np.abs(Rho) < threshold] = 0.0
+    rho_thresh = rho.copy()
+    rho_thresh[np.abs(rho) < threshold] = 0.0
 
-    Jij_new = Jij.copy()
-    for i in range(N):
-        for j in range(N):
+    jij_new = jij.copy()
+    for i in range(n):
+        for j in range(n):
             if i == j:
-                Jij_new[i, j] = 0.0
-            elif Rho_thresh[i, j] != 0.0:
-                Jij_new[i, j] = np.sign(Rho_thresh[i, j]) * abs(Jij[i, j])
-            # else: structural sign kept unchanged
+                jij_new[i, j] = 0.0
+            elif rho_thresh[i, j] != 0.0:
+                jij_new[i, j] = np.sign(rho_thresh[i, j]) * abs(jij[i, j])
+            # else: keep structural sign unchanged
 
-    return Jij_new, Rho_thresh
+    return jij_new, rho_thresh
 
 
 def enforce_symmetry(mat: np.ndarray, label: str = "") -> np.ndarray:
+    """Force symmetry via (A + Aᵀ)/2 when max asymmetry exceeds 1e-10."""
     err = np.max(np.abs(mat - mat.T))
     if err > 1e-10:
-        print(f"    [symmetry] {label}: max asymmetry={err:.2e} — enforcing (A+Aᵀ)/2")
+        print(f"  [symmetry] {label}: max asymmetry = {err:.2e} — enforcing (A+Aᵀ)/2")
         mat = (mat + mat.T) / 2.0
     return mat
 
 
-def print_diagnostics(Jij_init, Jij_new, Rho_thresh, s):
-    N         = Jij_init.shape[0]
-    off       = ~np.eye(N, dtype=bool)
-    n_above   = np.sum(Rho_thresh[off] != 0)
-    n_total   = np.sum(off)
-    n_flipped = np.sum(np.sign(Jij_new[off]) != np.sign(Jij_init[off]))
+def _print_jij_diagnostics(
+    jij_init:   np.ndarray,
+    jij_new:    np.ndarray,
+    rho_thresh: np.ndarray,
+    s:          int,
+) -> None:
+    n       = jij_init.shape[0]
+    offdiag = ~np.eye(n, dtype=bool)
+    n_above   = np.sum(rho_thresh[offdiag] != 0)
+    n_total   = np.sum(offdiag)
+    n_flipped = np.sum(np.sign(jij_new[offdiag]) != np.sign(jij_init[offdiag]))
     print(
         f"  Subject {s:02d} [{subject_session(s)}]: "
-        f"above-thresh={n_above}/{n_total} ({100*n_above/n_total:.1f}%)  "
-        f"sign-flips={n_flipped} ({100*n_flipped/n_total:.1f}%)"
+        f"above-thresh = {n_above}/{n_total} ({100 * n_above / n_total:.1f}%)  "
+        f"sign-flips = {n_flipped} ({100 * n_flipped / n_total:.1f}%)"
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN — build and save sign-corrected Jij matrices
+# ═══════════════════════════════════════════════════════════════════════════
 
-def main():
+def main() -> None:
     np.random.seed(SEED)
-    subject_ids = SUBJECT_IDS
+    threshold = C.THRESHOLD
 
     print("=" * 65)
-    print(f"BUILD JIJ_NEW (Pearson)  —  {len(subject_ids)} subjects  "
-          f"|  threshold={THRESHOLD}")
+    print(
+        f"BUILD JIJ_NEW (Pearson)  —  {len(SUBJECT_IDS)} subjects  "
+        f"|  threshold = {threshold}"
+    )
     print("=" * 65)
 
-    # pre-load the 3 session Pearson FC matrices
+    # Pre-load the three session Pearson FC matrices
     session_fc = {
-        "FC1": load_csv(FC1_PATH).astype(float),
-        "FC2": load_csv(FC2_PATH).astype(float),
-        "FC3": load_csv(FC3_PATH).astype(float),
+        "FC1": load_csv(C.FC1_PATH).astype(float),
+        "FC2": load_csv(C.FC2_PATH).astype(float),
+        "FC3": load_csv(C.FC3_PATH).astype(float),
     }
     for mat in session_fc.values():
-        np.fill_diagonal(mat, 0)
+        np.fill_diagonal(mat, 0.0)
+    print("Loaded session FC matrices: avg_TS_1, avg_TS_2, avg_TS_3\n")
 
-    print("\nLoaded session FC matrices: avg_TS_1, avg_TS_2, avg_TS_3")
+    JIJ_NEW_DIR.mkdir(parents=True, exist_ok=True)
+    all_jij_new = []
 
-    os.makedirs(JIJ_NEW_DIR, exist_ok=True)
-    all_Jij_new = []
+    for s in SUBJECT_IDS:
+        jij_path  = JIJ_RAW_DIR / JIJ_RAW_PATTERN.format(s)
+        jij_init  = load_csv(jij_path).astype(float)
+        rho_emp_s = session_fc[subject_session(s)]
 
-    for s in subject_ids:
+        if jij_init.shape != rho_emp_s.shape:
+            raise ValueError(
+                f"Subject {s:02d}: shape mismatch — "
+                f"Jij {jij_init.shape} vs Rho_emp {rho_emp_s.shape}"
+            )
 
-        jij_path = JIJ_DIR / JIJ_PATTERN.format(s)
-        Jij_init  = load_csv(jij_path).astype(float)
-        Rho_emp_s = session_fc[subject_session(s)]
-
-        assert Jij_init.shape == Rho_emp_s.shape, (
-            f"Subject {s:02d}: shape mismatch "
-            f"Jij {Jij_init.shape} vs Rho_emp {Rho_emp_s.shape}"
-        )
-
-        Jij_new, Rho_thresh = build_Jij_new(Jij_init, Rho_emp_s, THRESHOLD)
-        Jij_new = enforce_symmetry(Jij_new, f"Subject {s:02d}")
-        print_diagnostics(Jij_init, Jij_new, Rho_thresh, s)
+        jij_new, rho_thresh = build_jij_new(jij_init, rho_emp_s, threshold)
+        jij_new = enforce_symmetry(jij_new, f"Subject {s:02d}")
+        _print_jij_diagnostics(jij_init, jij_new, rho_thresh, s)
 
         out_path = JIJ_NEW_DIR / f"Jij_new_pearson_{s:02d}.csv"
-        save_csv(Jij_new, out_path)
-        all_Jij_new.append(Jij_new)
+        save_csv(jij_new, out_path)
+        all_jij_new.append(jij_new)
 
-    # average across subjects
-    print(f"\n[averaging]  avg_Jij_new across {len(subject_ids)} subjects …")
-    avg_Jij_new = np.mean(all_Jij_new, axis=0)
-    np.fill_diagonal(avg_Jij_new, 0)
+    # Average across all subjects
+    print(f"\n[averaging]  avg_Jij_new across {len(SUBJECT_IDS)} subjects …")
+    avg_jij_new = np.mean(all_jij_new, axis=0)
+    np.fill_diagonal(avg_jij_new, 0.0)
+    save_csv(avg_jij_new, AVG_JIJ_NEW_PATH)
 
-    save_csv(avg_Jij_new, AVG_JIJ_NEW_PATH)
-
-    off = avg_Jij_new[~np.eye(avg_Jij_new.shape[0], dtype=bool)]
+    offdiag = avg_jij_new[~np.eye(avg_jij_new.shape[0], dtype=bool)]
     print(
-        f"  avg_Jij_new_pearson : shape={avg_Jij_new.shape}  "
-        f"min={off.min():.4f}  max={off.max():.4f}  "
-        f"neg_fraction={np.mean(off < 0):.3f}"
+        f"  avg_Jij_new: shape = {avg_jij_new.shape}  "
+        f"min = {offdiag.min():.4f}  max = {offdiag.max():.4f}  "
+        f"neg_fraction = {np.mean(offdiag < 0):.3f}"
     )
     print(f"  Saved → {AVG_JIJ_NEW_PATH}")
     print(f"  Per-subject files → {JIJ_NEW_DIR}/")
-
 
 
 if __name__ == "__main__":

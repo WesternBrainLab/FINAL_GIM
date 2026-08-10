@@ -1,8 +1,31 @@
-import numpy as np
-import scipy.stats as sp
-import matplotlib.pyplot as plt
-import sys
+"""
+TEMP_SWEEP.py — Temperature sweep simulation for the Generalized Ising Model.
+
+Sweeps a range of global temperatures, running one or more independent Ising
+simulations at each step and recording energy, magnetisation, susceptibility,
+specific heat, and FC-correlation observables.
+
+This module is computation-only. GET_RESULTS.py is responsible for executing
+sweeps and saving their results.
+"""
+
+
+from __future__ import annotations
+
+import builtins
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+import CONFIG as C
+import UTILS  as utils
+import GIM    as I
+
+import os
+import scipy.stats as sp
+import sys
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -16,29 +39,16 @@ if str(PROJECT_ROOT) not in sys.path:
    sys.path.insert(0, str(PROJECT_ROOT))
 
 
-import steven.Scripts.ising3 as I
-import steven.Scripts.utils as utils
-import steven.Scripts.config as cf
-import os
-import pickle
-import builtins
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIRECTORY CONFIGURATION
+# DATA CONFIGURATION
 #
-# STEVEN_ROOT         – folder containing this script (steven/)
-# DEFAULT_TEMP_SWEEP_DIR – where simulation output is saved by default
-# PROJECT1_JIJ_PATH   – path to the averaged Jij connectivity matrix from
-#                       Kayla's project. This is the coupling matrix that
-#                       defines how strongly each pair of neurons influences
-#                       each other in the Ising model.
+# PROJECT1_JIJ_PATH is an optional alternate coupling matrix.  The normal
+# fallback is GIM.avg_Jij.
 # ─────────────────────────────────────────────────────────────────────────────
 FINAL_GIM_DIR = Path(__file__).resolve().parent
-# Temperature-sweep pickles/logs are intermediate data and stay under DATA.
-DEFAULT_TEMP_SWEEP_DIR = FINAL_GIM_DIR / "DATA" / "simulation data" / "temp sweep data"
 PROJECT1_ROOT = PROJECT_ROOT / 'kayla_1' / 'Project_1'
-PROJECT1_JIJ_PATH = FINAL_GIM_DIR / "DATA" / "Jij_new_pearson" / "avg_Jij_new_pearson.csv"
+PROJECT1_JIJ_PATH = C.AVG_JIJ_NEW_PATH
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,7 +81,17 @@ def default_jij():
        Jij = np.genfromtxt(PROJECT1_JIJ_PATH, delimiter=',').astype(float)
        np.fill_diagonal(Jij, 0)
        return Jij
-   return cf.avg_Jij
+   return I.avg_Jij
+
+# ── Shared empirical FC matrices (loaded once) ────────────────────────────
+_FC1 = utils.load_csv(C.FC1_PATH).astype(float)
+_FC2 = utils.load_csv(C.FC2_PATH).astype(float)
+_FC3 = utils.load_csv(C.FC3_PATH).astype(float)
+_avg_FC_pearson = utils.average_matrices(_FC1, _FC2, _FC3)
+_partial_FC1 = utils.load_csv(C.PARTIAL_FC1_PATH).astype(float)
+_partial_FC2 = utils.load_csv(C.PARTIAL_FC2_PATH).astype(float)
+_partial_FC3 = utils.load_csv(C.PARTIAL_FC3_PATH).astype(float)
+_avg_FC_partial = utils.average_matrices(_partial_FC1, _partial_FC2, _partial_FC3)
 
 
 # Main class for running temperature sweep
@@ -97,7 +117,7 @@ class simulated_FC_vs_T_global:
        :param Jij: Jij matrix used for all simulations
        :param ising: Ising timescale used for all simulations
        :param multiplier: temperature multiplier values used per neuron
-       :param save: set to True if you want to save data under simulation data/temp sweep data
+       :param save: retained for backwards compatibility; this module does not write results.
        '''
    # Builds an array of global temperatures to
    # sweep through, and sets up the Ising model parameters and data storage arrays.
@@ -143,7 +163,7 @@ class simulated_FC_vs_T_global:
 
        self.save = save
 
-
+# Main simulation function that runs the temperature sweep, executes the Ising simulations, and records the results.
    def simulate(self, steps, thermalization = None, spin_array = np.random.choice([-1, 1], 84),
                 partial = True, show = False, diag = False, text = True,
                 name = 'temp_sweep', path = None,
@@ -163,67 +183,10 @@ class simulated_FC_vs_T_global:
        :param show: if True, displays a live plot of all parameters as simulation runs
        :param diag: if True, includes diagonal values in correlation calculation between emp. and sim. FC
        :param text: if True, prints out text for each simulation that displays the final parameter values
-       :param name: set custom file name
-       :param path: set custom save path. If None, saves under steven/simulation data/temp sweep data.
+       :param name: retained for backwards compatibility.
+       :param path: retained for backwards compatibility.
        :return:
        '''
-
-
-       def save():
-           '''
-           If self.save == True, this function will generate a log containing information about the simulations
-           '''
-
-
-           self.message = f'SIMULATION LOG\n' \
-                          f'alpha: {self.alpha}\n' \
-                          f'temp range: {self.T_global[0]}-{self.T_global[-1]}\n' \
-                          f'temp steps: {np.size(self.T_global)}\n' \
-                          f'critical temperature: {self.crit_temp}\n' \
-                          f'susceptibility peak temperature: {self.suscept_peak_temp}\n' \
-                          f'specific heat peak temperature: {self.spec_heat_peak_temp}\n' \
-                          f'mean critical temperature: {np.mean((self.multiplier ** self.alpha) * self.crit_temp)}\n' \
-                          f'mean susceptibility peak temperature: {np.mean((self.multiplier ** self.alpha) * self.suscept_peak_temp)}\n' \
-                          f'mean specific heat peak temperature: {np.mean((self.multiplier ** self.alpha) * self.spec_heat_peak_temp)}\n' \
-                          f'best temperature: {self.best_temp}\n' \
-                          f'mean best temperature: {np.mean((self.multiplier ** self.alpha) * self.best_temp)}\n' \
-                          f'partial correlation: {partial}\n' \
-                          f'include diagonals: {diag}\n' \
-                          f'time scale: {self.ising}\n' \
-                          '----------------------------------\n' \
-                          'highest correlation run:\n' \
-                          f'{self.best_ising} \n' \
-                          '----------------------------------\n' \
-                          'critical temperature run:\n' \
-                          f'{self.crit_ising} \n'
-           import os
-
-
-           save_root = Path(path) if path is not None else DEFAULT_TEMP_SWEEP_DIR
-
-
-           # make sure the folder exists
-           save_root.mkdir(parents=True, exist_ok=True)
-
-
-           # count existing run folders
-           num_folders = len([
-               d for d in os.listdir(save_root)
-               if os.path.isdir(save_root / d)
-           ])
-
-
-           self.folder_name = name + '_run_' + str(num_folders)
-           self.path = save_root / self.folder_name
-           os.mkdir(self.path)
-
-
-           with open(self.path / 'log.txt', 'w') as dir:
-               dir.write(self.message)
-
-
-           pickle.dump(self.best_ising, open(self.path / 'best_ising.pickle', 'wb'))
-           pickle.dump(self.crit_ising, open(self.path / 'crit_ising.pickle', 'wb'))
 
 
        # Keep all scoring off-diagonal only. Diagonal FC values are
@@ -252,23 +215,27 @@ class simulated_FC_vs_T_global:
 
        if emp_FC1 is None or emp_FC2 is None or emp_FC3 is None or avg_FC is None:
            if partial:
-               emp_FC1 = cf.FC_1p
-               emp_FC2 = cf.FC_2p
-               emp_FC3 = cf.FC_3p
-               avg_FC = cf.avg_FCp
+               emp_FC1 = _partial_FC1
+               emp_FC2 = _partial_FC2
+               emp_FC3 = _partial_FC3
+               avg_FC = _avg_FC_partial
            else:
-               emp_FC1 = cf.FC_1
-               emp_FC2 = cf.FC_2
-               emp_FC3 = cf.FC_3
-               avg_FC = cf.avg_FC
+               emp_FC1 = _FC1
+               emp_FC2 = _FC2
+               emp_FC3 = _FC3
+               avg_FC = _avg_FC_pearson
 
 
-       emp_FC1 = np.asarray(emp_FC1, dtype=float).copy()
-       emp_FC2 = np.asarray(emp_FC2, dtype=float).copy()
-       emp_FC3 = np.asarray(emp_FC3, dtype=float).copy()
-       avg_FC = np.asarray(avg_FC, dtype=float).copy()
-       for emp_mat in (emp_FC1, emp_FC2, emp_FC3, avg_FC):
-           np.fill_diagonal(emp_mat, 0.0)
+       # Zero diagonals and convert empirical FC matrices to independent floats.
+       emp_mats = [emp_FC1, emp_FC2, emp_FC3, avg_FC]
+       emp_FC1, emp_FC2, emp_FC3, avg_FC = [
+           np.asarray(matrix, dtype=float).copy() for matrix in emp_mats
+       ]
+       for matrix in (emp_FC1, emp_FC2, emp_FC3, avg_FC):
+           np.fill_diagonal(matrix, 0.0)
+
+       n_repeats = builtins.max(1, builtins.int(n_repeats))
+       therm = thermalization if thermalization is not None else steps // 2
 
 
        if show:
@@ -285,7 +252,6 @@ class simulated_FC_vs_T_global:
            return mean, sd, sd / np.sqrt(values.size)
 
 
-       n_repeats = builtins.max(1, builtins.int(n_repeats))
        temp_buckets = []
        for temp in self.T_global:
            temp_ar = temp * (self.multiplier ** self.alpha)
@@ -309,7 +275,7 @@ class simulated_FC_vs_T_global:
                'fc_auc': [],
            })
 
-
+       # Simulation loop: for each repeat, run a simulation at each temperature and record the results.
        for repeat_idx in range(n_repeats):
            if text and n_repeats > 1:
                print(f'temperature sweep repeat {repeat_idx + 1}/{n_repeats}')
@@ -328,7 +294,7 @@ class simulated_FC_vs_T_global:
 
 
                ising = self.ising(temp_ar, Jij=self.Jij, spin_ar=init_spin)
-               ising.simulate(steps, thermalization)
+               ising.simulate(steps, therm)
                sim_FC = ising.generate_FC(partial)
                ising.functional_connectivity = np.nan_to_num(sim_FC, nan=0.0, posinf=0.0, neginf=0.0)
                np.fill_diagonal(ising.functional_connectivity, 0.0)
@@ -382,7 +348,7 @@ class simulated_FC_vs_T_global:
                    figure.canvas.draw()
                    figure.canvas.flush_events()
 
-
+        # Aggregate results across repeats for each temperature, selecting the best repeat based on correlation.
        for bucket in temp_buckets:
            repeat_corr_total_arr = np.asarray(bucket['corr_total'], dtype=float)
            if np.any(np.isfinite(repeat_corr_total_arr)):
@@ -445,7 +411,8 @@ class simulated_FC_vs_T_global:
        if show:
            plt.ioff()
 
-
+      # Identify the temperature corresponding to the peak susceptibility and specific heat.
+      # and record the critical temperature and correlation values.
        suscept_peak_index = np.nanargmax(self.suscept_ar)
        spec_heat_peak_index = np.nanargmax(self.spec_heat_ar)
        crit_index = spec_heat_peak_index
@@ -464,31 +431,3 @@ class simulated_FC_vs_T_global:
            print('critical temperature:', self.crit_temp)
            print('highest correlation run:')
            print(self.best_ising)
-
-
-       if self.save:
-           save()
-
-
- 
-
-# This is the main code that runs the temperature sweep simulation
-#  when this script is executed directly. It sets the parameters (config) for the simulation,
-# creates an instance of the simulated_FC_vs_T_global class, and calls the simulate method to
-#  perform the simulations. Results are then graphed and saved.
-
-if __name__ == '__main__':
-   steps = 2000
-   thermalization = 1000
-   min_temp = 0.5
-   max_temp = 20
-   temp_step = 50
-   alpha = 0
-   simulation = simulated_FC_vs_T_global(min_temp, max_temp, temp_step, alpha, ising = I.random_ising)
-   simulation.simulate(steps, thermalization, partial = False)
-
-
-
-
-
-

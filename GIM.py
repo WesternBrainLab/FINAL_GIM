@@ -1,26 +1,18 @@
 import numpy as np
-from scipy.stats import pearsonr
-from scipy.stats import ks_2samp
+import os
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import random
-import CONFIG as C
+
 import UTILS as utils
 import time
+import CONFIG as cf
+import pickle
 from abc import ABC, abstractmethod
 from matplotlib.colors import TwoSlopeNorm
-
-
-# ── Shared data loaded once at import time ────────────────────────────────
-# avg_Jij and avg_FCp are used as defaults so callers that don't pass
-# explicit matrices still get sensible behaviour.
-_avg_Jij = utils.load_csv(C.JIJ_PROCESSED_PATH).astype(float)
-_avg_FC1  = utils.load_csv(C.FC1_PATH).astype(float)
-_avg_FC2  = utils.load_csv(C.FC2_PATH).astype(float)
-_avg_FC3  = utils.load_csv(C.FC3_PATH).astype(float)
-avg_Jij   = _avg_Jij
-avg_FC    = utils.average_matrices(_avg_FC1, _avg_FC2, _avg_FC3)
-regions   = avg_Jij.shape[0]
-
+from copy import copy
+import json
+import FUNC_CON as fc
 
 '''
 This file contains the class objects which define the Ising model simulation. 3 (base) classes are defined; one for
@@ -72,8 +64,8 @@ class Spins:
     This class stores all nueron arrangements and spin information, and provides a function which allows spins of
     individual nuerons to be updated
     '''
-    
-    def __init__(self, Jij, spin_ar = None, directed = False):
+
+    def __init__(self, Jij, spin_ar=None):
         '''
         Initialize structural connectivity (Jij) matrix and array containing spin configurations. Magnetization and
         energy are calculated and stored for the initial spin state.
@@ -83,22 +75,16 @@ class Spins:
         :param spin_ar: Defines the spin orientation of all neurons. Up spin (excitory) neurons are represented as +1
                and down spin (inhibitory) neurons are represented as -1. If no array is provided, one is randomly
                generated based on the size of the Jij matrix.
-
-        :param directed: Parameter which indicates if the Jij matrix represents a directed or undirected graph (if
-               connections between neurons i and j are the same as connections between j to i.
         '''
 
-        self.directed = directed
         self.Jij = utils.normalize_array(Jij)
         self.size = np.shape(Jij)[0]
         if spin_ar is None:
             self.spins = np.random.choice([-1, 1], self.size)
         else:
-            self.spins = spin_ar
+            self.spins = spin_ar.copy()
         self.total_energy = self.hamiltonian()
         self.mag = self.magnetization()
-
-# Energy and Magnetization functions are defined here
 
     def energy(self, i, j):
         '''
@@ -124,7 +110,7 @@ class Spins:
         :return: System magnetization.
         '''
 
-        self.mag = np.sum(self.spins) / self.size
+        self.mag = abs(np.sum(self.spins)) / self.size
         return self.mag
 
     def find_dE(self, index):
@@ -136,8 +122,9 @@ class Spins:
         :return: Change in system energy.
         '''
 
-        temp_Jij = self.Jij[index].copy()
-        temp_Jij[index] = 0
+        temp_Jij = self.Jij[index, :]
+        if type(index) is list:
+            temp_Jij[:, index] = 0
         return -2 * np.sum(temp_Jij * (self.spins * -self.spins[index].reshape((np.size(index), 1))))
 
     def hamiltonian(self):
@@ -147,14 +134,9 @@ class Spins:
         :return: Total system energy.
         '''
 
-        if not self.directed:
-            return -np.sum(self.Jij * (self.spins * self.spins.reshape((np.size(self.spins), 1)))) / 2
-        else:
-            return -np.sum(self.Jij * (self.spins * self.spins.reshape((np.size(self.spins), 1))))
+        return -np.sum(self.Jij * (self.spins * self.spins.reshape((np.size(self.spins), 1)))) / 2
 
-# System Updates
-
-    def update(self, index, energy = None):
+    def update(self, index, energy=None):
         '''
         Update the system by changing the spins of a given set of neurons, and recalculating the system energy.
 
@@ -177,7 +159,7 @@ class Ising(ABC):
     This class is used as the base structure for implementations of the Ising model.
     '''
 
-    def __init__(self, temp, Jij = avg_Jij, spin_ar = None, directed = False):
+    def __init__(self, temp, Jij, beta = 1, spin_ar=None, save=False, directory=cf.ISING_DATA):
         '''
         Initialize simulation parameters. System energy and magnetization is stored per timestep of the simulation in
         arrays. A timer variable is also defined to measure how long the simulation takes.
@@ -189,15 +171,17 @@ class Ising(ABC):
         :param Jij: Structural connectivity matrix which stores the strength of synaptic connections between neurons
 
         :param spin_ar: Array which stores the position and spins of all neurons in the system
-
-        :param directed: Optional parameter which indicates if the Jij matrix is directed
         '''
 
         self.temp = temp
-        self.spin = Spins(Jij, spin_ar, directed)
+        self.Jij = Jij
+        self.spin = Spins(Jij, spin_ar)
         self.timer = 0
+        self.save = save
+        self.beta = beta
+        self.directory = directory
 
-    def metropolis_step(self, index, dE = None):
+    def metropolis_step(self, index, dE=None):
         '''
         Sets the update conditions for the simulation per time step. A set of neurons are proposed to flip, and their
         potential change in energy (dE) is calculated. if dE is negative (system goes into a lower energy state), the
@@ -230,7 +214,7 @@ class Ising(ABC):
 
         pass
 
-    def simulate(self, steps, thermalization = None):
+    def simulate(self, steps, thermalization, log = False):
         '''
         Performs the Ising model simulation and records the system state, total energy and magnetization for each
         time step.
@@ -247,23 +231,49 @@ class Ising(ABC):
         '''
 
         self.steps = steps
-        self.energy_series = np.zeros(self.steps)
-        self.mag_series = np.zeros(self.steps)
-        self.spin_series = np.zeros((self.spin.size, self.steps))
-
         self.therm = thermalization
-        for _ in range(thermalization):
-            start = time.time()
-            self.time_scale()
-            self.timer += time.time() - start
+        self.spin_series = np.zeros((self.spin.size, steps))
+        self.energy_series = np.zeros((steps, 1))
+        self.mag_series = np.zeros((steps, 1))
 
-        for i in range(self.steps):
-            start = time.time()
+        start = time.time()
+
+        for _ in range(thermalization):
+            self.time_scale()
+
+        for i in range(steps):
             self.time_scale()
             self.spin_series[:, i] = self.spin.spins
             self.energy_series[i] = self.spin.total_energy
             self.mag_series[i] = self.spin.magnetization()
-            self.timer += time.time() - start
+
+        self.timer = time.time() - start
+
+        if log:
+            self.log = {
+                'temperature': self.temp,
+                'Jij': self.Jij,
+                'thermalization': thermalization,
+                'steps': steps,
+                'time scale': self.__str__(),
+                'run time': self.timer,
+                'susceptibility': self.susceptibility(self.beta),
+                'specific heat': self.specific_heat(self.beta)}
+
+        if self.save:
+            num_folders = len(next(os.walk(self.directory))[1])
+            self.folder_name = 'ising_simulation_run_' + str(num_folders)
+            self.directory = cf.ISING_DATA + self.folder_name
+            os.mkdir(self.directory)
+
+            if log:
+                with open(self.directory + '/log.json', 'w') as file:
+                    json.dump(self.log, file, indent=4)
+
+            pickle.dump(self, open(self.directory + '/ising.pickle', 'wb'))
+
+        if log:
+            return self.log
 
     def generate_FC(self, partial = False):
         '''
@@ -271,59 +281,21 @@ class Ising(ABC):
         by applying a correlation function over the spin configuration array to find how correlated each neuron is
         with each other. Note that neuron pairs with high correlation tend to switch spins at the same frequency.
 
-        :param partial: Toggles between partial correlation and Pearson correlation. Partial correlation tends to be
-                        more accurate as it removes correlation effects from indirect neuron interactions, however
-                        takes longer to process.
-
         :return: Functional connectivity matrix
         '''
-
         self.partial = partial
-
-        if not self.partial:
-            self.functional_connectivity = np.nan_to_num(np.corrcoef(self.spin_series))
-        else:
-            for ridge in (1e-8, 1e-6, 1e-4, 1e-2):
-                try:
-                    self.functional_connectivity = np.nan_to_num(
-                        utils.part_corr(self.spin_series, ridge=ridge)
-                    )
-                    break
-                except ValueError:
-                    continue
-            else:
-                self.functional_connectivity = np.zeros(
-                    (self.spin_series.shape[0], self.spin_series.shape[0])
-                )
+        self.functional_connectivity = fc.generate_FC(self.spin_series, sim = True, partial = partial)
 
         return self.functional_connectivity
-
-    # For partial correlation, if the ridge value is too small, the matrix inversion can fail.
-    # This function tries a series of ridge values until it succeeds, or returns a zero matrix if all fail.
-    def _partial_fc_with_fallback(self) -> np.ndarray:
-        """Try increasing ridge values until part_corr succeeds."""
-        for ridge in (1e-8, 1e-6, 1e-4, 1e-2):
-            try:
-                return utils.part_corr(self.spin_series, ridge=ridge)
-            except ValueError:
-                continue
-        # All ridge values failed — return a zero matrix
-        n = self.spin_series.shape[0]
-        return np.zeros((n, n))
-
 
     def susceptibility(self, beta):
         '''
         Finds the susceptibility of the system after simulation. This measures how volatile the system is, with a high
         susceptibility indicating large changes to global magnetization per time step.
 
-        :param beta: Scaling parameter, often set to 1/the global temperature
-
         :return: The system susceptibility.
         '''
-
-        m = np.asarray(self.mag_series, dtype=float)
-        return self.spin.size * beta * (np.mean(m ** 2) - np.mean(np.abs(m)) ** 2)
+        return (np.var(np.abs(self.mag_series))) * beta
 
     def specific_heat(self, beta):
         '''
@@ -333,135 +305,116 @@ class Ising(ABC):
         dynamics of neurons in the brain. The critical temperature can be found by identifying the temperature value
         which maximizes specific heat.
 
-        :param beta: Scaling parameter, often set to 1/the global temperature
         :return:
         '''
+        return (np.var(self.energy_series)) * (beta ** 2)
 
-        e = np.asarray(self.energy_series, dtype=float)
-        return (beta ** 2) * np.var(e) / self.spin.size
-
-    def correlation(self, emp_FC = avg_FC, diag = False):
+    def graph_mag_energy(self, show=True):
         '''
-        Calculates the correlation between the simulated and empirical functional connectivity matrices.
+        Produces 2 graphs, one showing mean magnetization vs time and another showing mean energy vs time. If self.save
+        == True, running this method will also save the graphs as a png image.
 
-        :param emp_FC: Empirical functional connectivity matrix.
+        :param show: If True, the graph is displayed.
 
-        :param diag: If False, calculates the correlation without the diagonal values of each matrix. Diagonal valuess
-                     for the FC matrix are always 1, so they will always be perfectly correlated between the simulated
-                     and empirical matrices. This can skew results by making the correlation look higher than it
-                     actually is.
-
-        :return: Pearson correlation between the simulated and empirical FC.
+        :return: Saved/displayed graphs
         '''
+        iterations = np.arange(self.steps)
 
-        if diag:
-            sim_vec = self.functional_connectivity.flatten()
-            emp_vec = emp_FC.flatten()
+        mpl.rcParams['lines.markersize'] = 3
+        figure, axis = plt.subplots(1, 2)
+        axis[0].scatter(iterations, self.mag_series)
+        axis[0].plot(iterations, utils.average_series(self.mag_series), 'r', label='average mag')
+        axis[0].set_xlabel('steps')
+        axis[0].set_ylabel('magnetization')
+        axis[0].set_ylim([-1, 1])
+        axis[0].legend()
+        axis[1].set_ylim([np.min(self.energy_series), np.max(self.energy_series)])
+        axis[1].scatter(iterations, self.energy_series)
+        axis[1].plot(iterations, utils.average_series(self.energy_series), 'r', label='average energy')
+        axis[1].set_xlabel('steps')
+        axis[1].set_ylabel('energy')
+        axis[1].legend()
+
+        if self.save:
+            figure.savefig(self.directory + '/energy_mag_graph.png')
+
+        if show:
+            plt.show()
         else:
-            sim_vec = utils.flat_remove_diag(self.functional_connectivity)
-            emp_vec = utils.flat_remove_diag(emp_FC)
+            return figure, axis
 
-        sim_vec = np.nan_to_num(np.asarray(sim_vec, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-        emp_vec = np.nan_to_num(np.asarray(emp_vec, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-
-        mask = np.isfinite(sim_vec) & np.isfinite(emp_vec)
-        sim_vec = sim_vec[mask]
-        emp_vec = emp_vec[mask]
-
-        if sim_vec.size < 2 or np.std(sim_vec) == 0 or np.std(emp_vec) == 0:
-            return 0.0
-
-        r = pearsonr(sim_vec, emp_vec)[0]
-        return 0.0 if not np.isfinite(r) else float(r)
-
-    def distance(self):
-        """Return mean two-sample KS distance from the three empirical TS sets."""
-        simulated = np.asarray(self.spin_series, dtype=float).ravel()
-        distances = []
-        for folder in C.TS_SUBFOLDERS:
-            directory = C.TS_DATA_DIR / folder
-            for file_path in directory.iterdir():
-                if file_path.is_file():
-                    empirical = utils.get_matrix(file_path.name, directory)
-                    distances.append(ks_2samp(simulated, empirical.ravel()).statistic)
-        if not distances:
-            raise FileNotFoundError("No empirical time-series files found for KS distance.")
-        return float(np.mean(distances))
-    
-
-
-class get_data:
-    '''
-    This class acts as a wrapper for the Ising class, storing simulation data and providing methods that allows easy
-    visualization of parameters.
-    '''
-
-    def __init__(self, ising, beta, T_global, alpha, emp_FC = avg_FC, diag = False):
+    def graph_FC(self, show=True, title='simulated FC'):
         '''
-        Initializes parameters and stores simulation data for the calling
-        script to graph or save.
+        Produces heat map plots showing the simulated and empirical FC matrices, as well as the Jij matrix.If
+        self.save == True, running this method will also save the graphs as a png image.
 
-        :param ising: Ising class object post simulation.
+        :param show: If True, the graph is displayed.
 
-        :param beta: Scaling parameter, often set to 1/the global temperature.
-
-        :param T_global: Global temperature.
-
-        :param alpha: temperature fitting parameter.
-
-        :param emp_FC: empirical functional connectivity matrix.
-
-        :param diag: If False, calculates the correlation without the diagonal values of each matrix.
-
+        :return: Saved/displayed heatmaps.
         '''
 
-        self.ising = ising
-        self.FC = ising.functional_connectivity
-        self.emp_FC = emp_FC
-        self.Jij = ising.spin.Jij
-        self.beta = beta
-        self.T_global = T_global
-        self.alpha = alpha
-        self.partial = ising.partial
-        self.time = ising.timer
-        self.correlation = ising.correlation(self.emp_FC, diag)
-        self.suscept = ising.susceptibility(beta)
-        self.spec_heat = ising.specific_heat(beta)
-        self.message = f'SIMULATION LOG\n' \
-                  f'global temperature: {T_global}\n' \
-                  f'alpha: {alpha}\n' \
-                  f'thermalization: {self.ising.therm}\n' \
-                  f'partial correlation: {self.partial}\n' \
-                  f'time scale: {self.ising}\n' \
-                  f'run time: {self.time}s\n' \
-                  f'correlation: {self.correlation}\n' \
-                  f'susceptibility: {self.suscept}\n' \
-                  f'specific heat: {self.spec_heat}'
+        figure, axis = plt.subplots(1, 2, figsize=(10, 4))
+        norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+        sim_FC = axis[0].matshow(self.functional_connectivity['matrix'], cmap='coolwarm', norm=norm)
+        axis[0].set_title(title)
+        axis[1].matshow(self.Jij, cmap='coolwarm', norm=norm)
+        axis[1].set_title('Jij')
+        figure.colorbar(sim_FC, fraction=0.046, pad=0.04)
 
-    def __str__(self):
-        return self.message
+        if self.save:
+            figure.savefig(self.directory + '/matrix_graphs.png')
 
-class default_ising(Ising):
+        if show:
+            plt.show()
+        else:
+            return figure, axis
 
-    def __init__(self, temp, Jij = avg_Jij, spin_ar = None):
-        super().__init__(temp, Jij, spin_ar)
-        self.index = np.arange(self.spin.size)
+    def graph_everything(self, show = True):
+        '''
+        Produces all the previous plots meantioned above. If self.save == True, running this method will also save
+        the graphs as a png image.
 
-    def __str__(self):
-        return 'default Ising'
+        :param show: If True, the graph is displayed.
 
-    def time_scale(self):
-        update_index = []
-        for i in self.index:
-            if self.metropolis_step(i) is not None:
-                update_index.append(i)
-        self.spin.update(update_index)
+        :return: Saved/displayed heatmaps.
+        '''
+
+        energy_series = self.energy_series
+        mag_series = self.mag_series
+        iterations = np.arange(self.steps)
+
+        mpl.rcParams['lines.markersize'] = 3
+        figure, axis = plt.subplots(2, 2, figsize = (12, 9), constrained_layout = True)
+        axis[0, 0].scatter(iterations, mag_series)
+        axis[0, 0].plot(iterations, utils.average_series(mag_series), 'r')
+        axis[0, 0].set_ylim([0, 1])
+        axis[0, 0].set_xlabel('steps')
+        axis[0, 0].set_ylabel('magnetization')
+
+        axis[0, 1].set_ylim([np.min(energy_series), np.max(energy_series)])
+        axis[0, 1].scatter(iterations, energy_series)
+        axis[0, 1].plot(iterations, utils.average_series(energy_series), 'r')
+        axis[0, 1].set_xlabel('steps')
+        axis[0, 1].set_ylabel('energy')
+
+        axis[1, 0].matshow(self.functional_connectivity['matrix'])
+        axis[1, 0].set_title('simulated FC')
+        axis[1, 1].matshow(self.Jij)
+        axis[1, 1].set_title('Jij')
+
+        if self.save:
+            figure.savefig(self.directory + '/everything_graphs.png')
+
+        if show:
+            plt.show()
+        else:
+            return figure, axis
 
 
 class Jij_sorted_ising(Ising):
 
-    def __init__(self, temp, Jij = avg_Jij, directed = False, spin_ar = None):
-        super().__init__(temp, Jij, spin_ar, directed)
+    def __init__(self, temp, Jij, beta = 1, spin_ar=None, save=False, directory=cf.ISING_DATA):
+        super().__init__(temp, Jij, beta, spin_ar, save, directory)
         ind_avg_Jij = np.mean(Jij, 0)
         self.index = utils.cross_sort(ind_avg_Jij)
 
@@ -477,10 +430,12 @@ class Jij_sorted_ising(Ising):
 
 class random_ising(Ising):
 
-    def __init__(self, temp, Jij = avg_Jij, spin_ar = None, directed = False, num_index = None):
-        super().__init__(temp, Jij, spin_ar, directed)
+    def __init__(self, temp, Jij, beta = 1, spin_ar=None, clusters=1, num_index = None, save=False, directory=cf.ISING_DATA):
+        super().__init__(temp, Jij, beta, spin_ar, save, directory)
+        self.regions = np.shape(Jij)[0]
+        self.clusters = clusters
         if num_index is None:
-            self.num_index = np.shape(Jij)[0]
+            self.num_index = self.regions
         else:
             self.num_index = num_index
 
@@ -488,25 +443,29 @@ class random_ising(Ising):
         return f'random Ising with num_index = {self.num_index}'
 
     def time_scale(self):
-        random_index = np.random.choice(regions, size = self.num_index)
-        for i in random_index:
-            dE = self.metropolis_step(i)
-            if dE is not None:
-                self.spin.update(i, dE)
+        rng = np.random.default_rng()
+        for _ in range(self.clusters):
+            random_index = rng.choice(self.regions, size=self.num_index, replace=False)
+            for i in random_index:
+                dE = self.metropolis_step(i)
+                if dE is not None:
+                    self.spin.update(i, dE)
 
 
-#  Helper used by TEMP_SWEEP.py to construct a get_data object with the same
-#  as the original I.get_data() call.
+if __name__ == '__main__':
+    t_global = 5.69
+    alpha = 1.5
+    temp = t_global * (cf.norm_ind_avg_Jij ** alpha)
+    beta = 1 / np.mean(temp)
+    steps = 2000
+    Jij = cf.avg_Jij * utils.get_sign_matrix(cf.avg_FC)
 
-def build_get_data(
-    ising:    Ising,
-    beta:     float,
-    T_global: float,
-    alpha:    float,
-    emp_FC:   np.ndarray = avg_FC,
-    diag:     bool = False,
-) -> get_data:
-    """Convenience constructor — mirrors the original I.get_data() call pattern."""
-    return get_data(ising, beta, T_global, alpha, emp_FC=emp_FC, diag=diag)
+    simulation = Jij_sorted_ising(temp, Jij=Jij)
+    simulation.simulate(steps, 1000)
+    simulation.generate_FC(False)
+    plt.matshow(simulation.functional_connectivity)
+    plt.show()
 
-    data = get_data(simulation, beta, t_global, alpha, emp_FC = avg_FC, save = False)
+    data = get_data(simulation, beta, t_global, alpha, emp_FC=cf.avg_FC, save=False)
+    data.graph_mag_energy()
+    data.graph_FC()

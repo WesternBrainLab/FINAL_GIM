@@ -1,179 +1,203 @@
-import numpy as np
-import scipy.stats as sp
-import scipy.integrate as int
-import matplotlib.pyplot as plt
+"""Run an Ising temperature sweep and save Pearson-style diagnostic plots."""
 
+import json
+import pickle
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+import CONFIG as cf
 import FUNC_CON as fc
 import GIM as I
 import UTILS as utils
-import CONFIG as cf
-import os
-import pickle
-import json
-from copy import copy
+
+
+BLUE = "#2E86AB"
+GREEN = "#2CA25F"
+RED = "#E84855"
+AMBER = "#F4A261"
 
 
 class temp_sweep:
+    """Temperature sweep with observables and empirical-FC comparisons."""
 
-    def __init__(self,
-                 min_temp,
-                 max_temp,
-                 temp_step,
-                 alpha,
-                 multiplier,
-                 Jij,
-                 ising = I.Jij_sorted_ising,
-                 save = False,
-                 name = 'temp_sweep',
-                 path = cf.TEMP_SWEEP_DATA):
-
-        '''
-        Runs multiple Ising model simulations at increasing temperatures, then graphs temperature vs average energy,
-        average magnetization, specific heat, and magnetic susceptibility at the end.
-
-        :param min_temp: starting temperature value
-        :param max_temp: ending temperature value
-        :param temp_step: number of temperature steps to get from start to end
-        :param alpha: alpha value
-        :param Jij: Jij matrix used for all simulations
-        :param ising: Ising timescale used for all simulations
-        :param multiplier: temperature multiplier values used per neuron
-        :param save: set to True if you want to save data under simulation data/temp sweep data
-        '''
-
+    def __init__(self, min_temp, max_temp, temp_step, alpha, multiplier, Jij,
+                 ising=I.Jij_sorted_ising, save=False, name="temp_sweep",
+                 path=cf.TEMP_SWEEP_DATA):
         self.T_global = np.linspace(min_temp, max_temp, temp_step)
         self.alpha = alpha
-        self.multiplier = multiplier
-        self.Jij = Jij
+        self.multiplier = np.asarray(multiplier, dtype=float)
+        self.Jij = np.asarray(Jij, dtype=float)
         self.ising = ising
+        self.save = save
+        self.path = Path(path)
+        self.name = name
 
         self.sim_dataset = {}
+        self.models = []
         self.ising_ar = []
         self.suscept_ar = []
         self.spec_heat_ar = []
-        self.avg_temp_ar = []
+        self.avg_energy_ar = []
+        self.avg_mag_ar = []
+        self.corr_ar = []
 
-        self.save = save
-        if self.save:
-            num_folders = len(next(os.walk(path))[1])
-            self.folder_name = name + '_run_' + str(num_folders)
-            self.path = path + '/' + self.folder_name
-            os.mkdir(self.path)
-
-    def simulate(self,
-                 steps,
-                 thermalization,
-                 spin_array = None,
-                 partial = False,
-                 show = False,
-                 diag = False):
-
-        '''
-        Main class for preforming the temperature sweep simulations
-
-        :param steps: number of timesteps per simulation
-        :param thermalization: number of thermalization steps per simulation
-        :param spin_array: set initial spin configuration for all simulations. Default is randomized
-        :param partial: if True, uses partial correlation to calculate FC matrix
-        :param show: if True, displays a live plot of all parameters as simulation runs
-        :param diag: if True, includes diagonal values in correlation calculation between emp. and sim. FC
-        :param text: if True, prints out text for each simulation that displays the final parameter values
-        :param name: set custom file name
-        :param path: set custom save path
-        :return:
-        '''
-
-        def save():
-            '''
-            If self.save == True, this function will generate a log containing information about the simulations
-            '''
-            fc.save_to_json(self.sim_dataset, self.path, 'sim_dataset.json')
-
-            with open(self.path + '/log.json', 'w') as file:
-                json.dump(self.log, file, indent=4)
-
-            pickle.dump(self.crit_ising, open(self.path + '/crit_ising.pickle', 'wb'))
-
+    def simulate(self, steps, thermalization, spin_array=None, partial=False,
+                 empirical_fc=None, show=False):
+        """Run the sweep and calculate observables for every temperature."""
         if spin_array is None:
-            spin_array = np.random.choice([-1, 1], 84)
+            spin_array = np.random.choice([-1, 1], self.Jij.shape[0])
         else:
             spin_array = np.asarray(spin_array).copy()
 
-        if show:
-            plt.ion()
+        empirical_fc = cf.avg_FC if empirical_fc is None else np.asarray(empirical_fc)
 
-        for id, temp in enumerate(self.T_global):
-            temp_ar = temp * (self.multiplier ** self.alpha)
-            avg_temp = np.mean(temp_ar)
-            beta = 1 / temp
+        for index, temp in enumerate(self.T_global):
+            temperatures = temp * self.multiplier ** self.alpha
+            model = self.ising(
+                temperatures,
+                Jij=self.Jij,
+                beta=1 / temp,
+                spin_ar=spin_array.copy(),
+            )
+            log = model.simulate(steps, thermalization, log=True)
+            simulated_fc = model.generate_FC(partial=partial)
+            simulated_matrix = np.asarray(simulated_fc["matrix"])
 
-            ising = self.ising(temp_ar, Jij = self.Jij, beta = beta, spin_ar = spin_array.copy())
-            log = ising.simulate(steps, thermalization, log = True)
-            print(str(id) + ': ' + str(temp))
-            self.sim_dataset[id] = ising.generate_FC(partial)
-
-            self.avg_temp_ar.append(avg_temp)
+            self.models.append(model)
             self.ising_ar.append(log)
-            self.suscept_ar.append(ising.susceptibility(beta))
-            self.spec_heat_ar.append(ising.specific_heat(beta))
+            self.sim_dataset[index] = simulated_fc
+            self.suscept_ar.append(float(model.susceptibility(1 / temp)))
+            self.spec_heat_ar.append(float(model.specific_heat(1 / temp)))
+            self.avg_energy_ar.append(float(np.mean(model.energy_series)))
+            self.avg_mag_ar.append(float(np.mean(np.abs(model.mag_series))))
+            self.corr_ar.append(float(utils.mat_corr(simulated_matrix, empirical_fc)))
 
+            print(f"{index + 1}/{len(self.T_global)}: T={temp:.4f}")
             if show:
-                if temp != self.T_global[0]:
-                    plt.close()
-                figure, axis = ising.graph_everything(show=False)
-                figure.canvas.draw()
-                figure.canvas.flush_events()
-        if show:
-            plt.close()
-            plt.ioff()
+                model.graph_everything(show=True)
 
-        crit_index = np.nanargmax(self.spec_heat_ar)
-        self.crit_temp = self.T_global[crit_index]
-        self.crit_ising = self.ising_ar[crit_index]
-        self.log = {'alpha': self.alpha,
-                    'multiplier': self.multiplier.tolist(),
-                    'min temp': self.T_global[0],
-                    'max temp': self.T_global[-1],
-                    'temp steps': np.size(self.T_global),
-                    'critical temperature': self.crit_temp,
-                    'mean critical temperature': np.mean((self.multiplier ** self.alpha) * self.crit_temp),
-                    'partial correlation': partial,
-                    'include diagonals': diag,
-                    'time scale': ising.__str__()}
+        self.crit_index = int(np.nanargmax(self.spec_heat_ar))
+        self.best_index = int(np.nanargmax(self.corr_ar))
+        self.crit_temp = float(self.T_global[self.crit_index])
+        self.best_temp = float(self.T_global[self.best_index])
+        self.crit_ising = self.models[self.crit_index]
+        self.best_ising = self.models[self.best_index]
 
-        print(self.log)
+        self.log = {
+            "alpha": float(self.alpha),
+            "min temp": float(self.T_global[0]),
+            "max temp": float(self.T_global[-1]),
+            "temp steps": len(self.T_global),
+            "critical temperature": self.crit_temp,
+            "best temperature": self.best_temp,
+            "best correlation": float(self.corr_ar[self.best_index]),
+            "partial correlation": partial,
+        }
 
         if self.save:
-            save()
+            self.path.mkdir(parents=True, exist_ok=True)
+            fc.save_to_json(self.sim_dataset, str(self.path), "sim_dataset.json")
+            with open(self.path / "log.json", "w") as file:
+                json.dump(self.log, file, indent=2)
+            with open(self.path / "crit_ising.pickle", "wb") as file:
+                pickle.dump(self.crit_ising, file)
 
-    def correlate(self, emp_dataset):
-        self.temp_corr = np.zeros([np.size(self.T_global), np.uint8(len(emp_dataset))])
-        for sim_id in self.sim_dataset:
-            for emp_id in emp_dataset:
-                sim_FC = np.array(self.sim_dataset[sim_id]['matrix'])
-                emp_FC = np.array(emp_dataset[emp_id]['matrix'])
-                self.temp_corr[np.uint8(sim_id), np.uint8(emp_id)] = utils.mat_corr(sim_FC, emp_FC)
+        return self
 
+    def correlate(self, empirical_dataset):
+        """Compare every simulated FC with every FC in an empirical dataset."""
+        self.temp_corr = np.asarray([
+            [utils.mat_corr(sim["matrix"], emp["matrix"])
+             for emp in empirical_dataset.values()]
+            for sim in self.sim_dataset.values()
+        ])
         return self.temp_corr
 
-    def graph_corr(self):
-        [temp, emp_FC] = np.shape(self.temp_corr)
-        for emp_id in range(emp_FC):
-            plt.plot(self.T_global, self.temp_corr[:, emp_id])
-        plt.xlabel('Global Temperature')
-        plt.ylabel('Correlation')
+    def graph_corr(self, output_path):
+        fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+        ax.plot(self.T_global, self.corr_ar, color=BLUE, linewidth=2)
+        ax.axvline(self.crit_temp, color=RED, linestyle="--",
+                   label=f"T_crit = {self.crit_temp:.2f}")
+        ax.axvline(self.best_temp, color=AMBER, linestyle=":",
+                   label=f"T_best = {self.best_temp:.2f}")
+        ax.set_xlabel("Global temperature T")
+        ax.set_ylabel("Pearson r (simulated FC vs empirical FC)")
+        ax.set_title("Correlation vs Temperature")
+        ax.legend(framealpha=0.3)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
-        plt.show()
+    def graph_data(self, output_dir=None):
+        """Save the requested temperature, matrix, and correlation figures."""
+        output_dir = Path(output_dir or cf.PROJECT_ROOT + "RESULTS/TEMP_SWEEP/")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+        panels = [
+            (axes[0, 0], self.avg_mag_ar, "M: average |magnetization|", BLUE),
+            (axes[0, 1], self.suscept_ar, "S: susceptibility", GREEN),
+            (axes[1, 0], self.avg_energy_ar, "E: average energy", BLUE),
+            (axes[1, 1], self.spec_heat_ar, "C: specific heat", RED),
+        ]
+        for ax, values, ylabel, color in panels:
+            ax.plot(self.T_global, values, color=color, linewidth=2)
+            ax.axvline(self.crit_temp, color=RED, linestyle="--", label="T_crit")
+            ax.set_xlabel("Global temperature T")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{ylabel} vs temperature")
+            ax.legend(framealpha=0.3)
+            ax.spines[["top", "right"]].set_visible(False)
+        fig.savefig(output_dir / "temperature_sweep_3.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        self.graph_corr(output_dir / "correlation_r_vs_temperature.png")
+
+        empirical = np.asarray(cf.avg_FC)
+        structural = np.asarray(self.Jij)
+        critical_fc = np.asarray(self.models[self.crit_index].functional_connectivity["matrix"])
+        best_fc = np.asarray(self.models[self.best_index].functional_connectivity["matrix"])
+        matrix_limit = max(np.max(np.abs(empirical)), np.max(np.abs(critical_fc)),
+                           np.max(np.abs(best_fc)), np.max(np.abs(structural)))
+        matrix_limit = max(float(matrix_limit), 1e-12)
+
+        fig, axes = plt.subplots(2, 3, figsize=(14, 9), constrained_layout=True)
+        rows = [
+            ("Critical temperature", self.crit_temp, critical_fc, self.corr_ar[self.crit_index]),
+            ("Best Pearson r temperature", self.best_temp, best_fc, self.corr_ar[self.best_index]),
+        ]
+        for row, (label, temp, simulated, correlation) in enumerate(rows):
+            matrices = [simulated, empirical, structural]
+            titles = [
+                f"Simulated FC\nT={temp:.3f}, r={correlation:.4f}",
+                "Empirical FC",
+                "Structural matrix J",
+            ]
+            for col, (matrix, title) in enumerate(zip(matrices, titles)):
+                image = axes[row, col].imshow(
+                    matrix, cmap="RdBu_r", vmin=-matrix_limit, vmax=matrix_limit
+                )
+                axes[row, col].set_title(title)
+                axes[row, col].set_xlabel("region")
+                axes[row, col].set_ylabel("region")
+                fig.colorbar(image, ax=axes[row, col], fraction=0.046, pad=0.04)
+        fig.suptitle("Functional connectivity and structural matrix comparisons", fontsize=14)
+        fig.savefig(output_dir / "FC_matrices_critical_and_best.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
 
-if __name__ == '__main__':
-    steps = 4000
-    thermalization = 2000
-    min_temp = 0.05
-    max_temp = 10
-    temp_step = 100
-    alpha = 2
-    Jij = cf.avg_Jij * utils.get_sign_matrix(cf.avg_FC)
-    simulation = temp_sweep(min_temp, max_temp, temp_step, alpha, Jij = Jij, ising = I.Jij_sorted_ising)
-    simulation.simulate(steps, thermalization, partial = False, show = True)
-    simulation.graph_data(True)
+if __name__ == "__main__":
+    simulation = temp_sweep(
+        0.05,
+        10.0,
+        100,
+        2.0,
+        multiplier=cf.norm_ind_avg_Jij,
+        Jij=cf.avg_Jij * utils.get_sign_matrix(cf.avg_FC),
+        ising=I.Jij_sorted_ising,
+    )
+    simulation.simulate(4000, 2000, partial=False, show=False)
+    simulation.graph_data()
+    print("Saved temperature_sweep_3.png, correlation_r_vs_temperature.png, and FC_matrices_critical_and_best.png")

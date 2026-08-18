@@ -8,7 +8,7 @@ import numpy as np
 from scipy.stats import pearsonr
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-RESULTS_DIR = PROJECT_DIR / "RESULTS"
+RESULTS_DIR = PROJECT_DIR / "RESULTS" / "Mu_vs_pet"
 sys.path.insert(0, str(PROJECT_DIR))
 
 import UTILS as utils

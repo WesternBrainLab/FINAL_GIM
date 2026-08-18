@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import ISING as I
+import GIM as I
 import UTILS as utils
 import CONFIG as cf
 import optuna
@@ -12,7 +12,6 @@ import pandas as pd
 import FUNC_CON as fc
 import scipy as sp
 import matplotlib.colors as colors
-
 
 class optimize():
 

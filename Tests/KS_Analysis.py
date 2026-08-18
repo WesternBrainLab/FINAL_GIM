@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import ks_2samp
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-RESULTS_DIR = PROJECT_DIR / "RESULTS"
+RESULTS_DIR = PROJECT_DIR / "RESULTS" / "KS_Analysis"
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 

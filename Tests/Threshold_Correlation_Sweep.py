@@ -65,7 +65,7 @@ def run_sweep(jij, empirical_fc, temperature, alpha, thresholds,
     ax.spines[["top", "right"]].set_visible(False)
 
     if output_dir is None:
-        output_dir = PROJECT_DIR / "RESULTS"
+        output_dir = PROJECT_DIR / "RESULTS" / "Threshold_Correlation_Sweep"
     output_dir.mkdir(parents=True, exist_ok=True)
     png = output_dir / "threshold_corr_combined_diag_vs_no_diag.png"
     csv = png.with_suffix(".csv")
@@ -94,5 +94,5 @@ if __name__ == "__main__":
         jij, cf.avg_FC, args.temperature, args.alpha,
         np.arange(args.threshold_start, args.threshold_stop, args.threshold_step),
         args.restarts, args.steps, args.thermalization,
-        output_dir=PROJECT_DIR / "RESULTS",
+        output_dir=PROJECT_DIR / "RESULTS" / "Threshold_Correlation_Sweep",
     )

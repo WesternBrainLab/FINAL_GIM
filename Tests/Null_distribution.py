@@ -182,5 +182,5 @@ if __name__ == "__main__":
     run_null_distribution(
         jij, empirical, args.temperature, args.alpha, args.threshold,
         args.n_null, args.steps, args.thermalization, args.runs,
-        PROJECT_DIR / "RESULTS",
+        PROJECT_DIR / "RESULTS" / "Null_distribution",
     )

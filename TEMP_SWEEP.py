@@ -3,10 +3,10 @@ import scipy.stats as sp
 import scipy.integrate as int
 import matplotlib.pyplot as plt
 
-import FuncCon as fc
-import ising as I
-import utils
-import config as cf
+import FUNC_CON as fc
+import GIM as I
+import UTILS as utils
+import CONFIG as cf
 import os
 import pickle
 import json

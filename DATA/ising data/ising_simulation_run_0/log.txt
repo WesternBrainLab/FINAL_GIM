@@ -1,0 +1,10 @@
+SIMULATION LOG
+global temperature: 5.69
+alpha: 1.5
+thermalization: 1000
+partial correlation: False
+time scale: Jij sorted Ising
+run time: 0.7531578540802002s
+correlation: 0.6230617431730682
+susceptibility: 0.03381334384433592
+specific heat: 36.58786953642959

@@ -1,249 +1,179 @@
 import numpy as np
+import scipy.stats as sp
+import scipy.integrate as int
 import matplotlib.pyplot as plt
+
+import FuncCon as fc
 import ising as I
 import utils
 import config as cf
-import optuna
-from datetime import date
 import os
 import pickle
 import json
-import pandas as pd
-import FuncCon as fc
-import scipy as sp
-import matplotlib.colors as colors
+from copy import copy
 
 
-class optimize():
+class temp_sweep:
 
     def __init__(self,
-                 steps,
-                 therm,
-                 Jij,
+                 min_temp,
+                 max_temp,
+                 temp_step,
+                 alpha,
                  multiplier,
+                 Jij,
                  ising = I.Jij_sorted_ising,
-                 spins = np.random.choice([-1, 1], 84),
-                 partial = False,
-                 directory = cf.OPTIM_DATA,
-                 save = False):
-        '''
-        Preforms parameter annealing to find optimal global temperature and alpha values. This is done by defining an
-        error function between the simulated and empirical FC matrices and sampling random alpha and temperature values.
-        The values sampled are addaptively selected based on the previous error value, such that if a simulation
-        produces low error, the next set of global temperature and alpha values will be close to the previous values.
+                 save = False,
+                 name = 'temp_sweep',
+                 path = cf.TEMP_SWEEP_DATA):
 
-        :param ising: type of timescale used
-        :param spins: set initial spin values
-        :param Jij: set Jij matrix
-        :param partial: if True, use partial correlation to generate simulated FC matrix
-        :param multiplier: temperature multiplier per neuron
-        :param save: if True, saves results under simulation data/optimization data
+        '''
+        Runs multiple Ising model simulations at increasing temperatures, then graphs temperature vs average energy,
+        average magnetization, specific heat, and magnetic susceptibility at the end.
+
+        :param min_temp: starting temperature value
+        :param max_temp: ending temperature value
+        :param temp_step: number of temperature steps to get from start to end
+        :param alpha: alpha value
+        :param Jij: Jij matrix used for all simulations
+        :param ising: Ising timescale used for all simulations
+        :param multiplier: temperature multiplier values used per neuron
+        :param save: set to True if you want to save data under simulation data/temp sweep data
         '''
 
-        self.ising = ising
-        self.spins = spins
-        self.Jij = Jij
-        self.partial = partial
+        self.T_global = np.linspace(min_temp, max_temp, temp_step)
+        self.alpha = alpha
         self.multiplier = multiplier
-        self.steps = steps
-        self.therm = therm
-        self.directory = directory
+        self.Jij = Jij
+        self.ising = ising
+
+        self.sim_dataset = {}
+        self.ising_ar = []
+        self.suscept_ar = []
+        self.spec_heat_ar = []
+        self.avg_temp_ar = []
+
         self.save = save
-        if save:
-            run_index = str(len(next(os.walk(cf.OPTIM_DATA))[1]))
-            cur_date = date.today()
-            save_folder_name = '/parameter optimization run ' + run_index + '_' + cur_date.strftime("%d_%m_%Y")
-            self.directory = self.directory + save_folder_name
-
-            os.mkdir(self.directory)
-
-
-    def train(self, train_FC, trials = 100, temp_range = [0, 1], alpha_range = [0, 3]):
-        '''
-        Preforms the annealing operation
-
-        :param steps: number of simulations ran
-        :param maxfun: sets the "group size" for an annealing run. This sets a limit for how many times a series of
-                       update algorithms can be run before resetting the annealing process and selecting new random
-                       variables. This prevents the algorithm from being stuck at a local error minimum, which may not
-                       be the lowest error the system may achieve
-        :param emp_FC: set the emprical FC matrix to be compared to
-        :param therm: set number of thermalization steps
-        :param no_local_search: If true, the algorithm won't preform a "sub-annealing" operation, which basically does
-                                a seperate annealing search that only restricts itself around 1 set of parameters. This
-                                is usually done to get super accurate ideal parameters, but for our purposes it's not
-                                necessary and is generally just a waste of time
-        :param show: If True, shows a live plot of energy and spin data for each annealing run
-        '''
-
-        def objective(trial):
-            beta = trial.suggest_float('t_glob', t_lower, t_upper)
-            alpha = trial.suggest_float('alpha', alpha_lower, alpha_upper)
-            t_glob = 1/beta
-            temp = t_glob * self.multiplier ** alpha
-            thresh = trial.suggest_float('thresh', 0, 1)
-            error_arr = []
-            train_id = np.arange(nFC)
-            np.random.shuffle(train_id)
-
-            for step, id in enumerate(train_id):
-                emp_FC = np.array(train_FC[str(id)]['matrix'])
-                Jij = self.Jij * utils.get_sign_matrix(emp_FC, thresh)
-                time_series = self.ising(temp, Jij = Jij, spin_ar = self.spins.copy())
-                time_series.simulate(self.steps, thermalization=self.therm)
-                FC = np.array(time_series.generate_FC(partial = self.partial)['matrix'])
-                correlate = utils.mat_corr(FC, emp_FC)
-                error = ((1 - correlate) + np.sqrt(np.mean((FC - emp_FC) ** 2))) ** 2
-                error_arr.append(error)
-                avg_error = np.mean(error_arr)
-                print('tests complete: ', step + 1, '/', nFC, ' | error: ', error, ' | average error: ', avg_error)
-                trial.report(avg_error, step=step)
-
-                if trial.should_prune() or np.isnan(error):
-                    raise optuna.TrialPruned()
-
-            return avg_error
-
-        self.study = optuna.create_study(pruner =
-                                         optuna.pruners.MedianPruner(n_startup_trials=3,
-                                                                     n_warmup_steps=1,
-                                                                     interval_steps=1))
-        [t_lower, t_upper] = temp_range
-        [alpha_lower, alpha_upper] = alpha_range
-        nFC = len(train_FC)
-
-        self.study.optimize(objective, n_trials = trials)
-        self.dataframe = self.study.trials_dataframe()
         if self.save:
-            self.dataframe.to_csv(self.directory + "/log.csv", index=False)
-            best_trial = {'lowest error': self.study.best_value,
-                          'best parameters': self.study.best_params,
-                          'Jij': self.Jij.tolist(),
-                          'multiplier': self.multiplier.tolist(),
-                          'partial': self.partial}
-            with open(self.directory + '/best_trial.json', 'w') as file:
-                json.dump(best_trial, file, indent=4)
-        return self.dataframe
+            num_folders = len(next(os.walk(path))[1])
+            self.folder_name = name + '_run_' + str(num_folders)
+            self.path = path + '/' + self.folder_name
+            os.mkdir(self.path)
 
-    def test(self, test_FC):
-        t_glob = 1 / self.study.best_params['t_glob']
-        alpha = self.study.best_params['alpha']
-        thresh = self.study.best_params['thresh']
-        temp = t_glob * self.multiplier ** alpha
-        nFC = len(test_FC)
-        print(nFC)
-        error_arr = []
+    def simulate(self,
+                 steps,
+                 thermalization,
+                 spin_array = None,
+                 partial = False,
+                 show = False,
+                 diag = False):
 
-        for id in test_FC:
-            print(id)
-            emp_FC = test_FC[id]['matrix']
-            Jij = self.Jij * utils.get_sign_matrix(emp_FC, thresh)
-            time_series = self.ising(temp, Jij=Jij, spin_ar=self.spins.copy())
-            time_series.simulate(self.steps, thermalization=self.therm)
-            FC = time_series.generate_FC(partial=self.partial)['matrix']
+        '''
+        Main class for preforming the temperature sweep simulations
 
-            correlate = utils.mat_corr(FC, emp_FC)
-            error = ((1 - correlate) + np.sqrt(np.mean((FC - emp_FC) ** 2))) ** 2
-            error_arr.append(error)
-            print('tests complete: ', id, '/', nFC, ' | error: ', error)
-        avg_error = np.mean(error_arr)
-        print('average error: ', avg_error)
+        :param steps: number of timesteps per simulation
+        :param thermalization: number of thermalization steps per simulation
+        :param spin_array: set initial spin configuration for all simulations. Default is randomized
+        :param partial: if True, uses partial correlation to calculate FC matrix
+        :param show: if True, displays a live plot of all parameters as simulation runs
+        :param diag: if True, includes diagonal values in correlation calculation between emp. and sim. FC
+        :param text: if True, prints out text for each simulation that displays the final parameter values
+        :param name: set custom file name
+        :param path: set custom save path
+        :return:
+        '''
 
-    def plot(self, x_axis, y_axis):
-        fig = plot_error(x_axis, y_axis, self.dataframe)
+        def save():
+            '''
+            If self.save == True, this function will generate a log containing information about the simulations
+            '''
+            fc.save_to_json(self.sim_dataset, self.path, 'sim_dataset.json')
+
+            with open(self.path + '/log.json', 'w') as file:
+                json.dump(self.log, file, indent=4)
+
+            pickle.dump(self.crit_ising, open(self.path + '/crit_ising.pickle', 'wb'))
+
+        if spin_array is None:
+            spin_array = np.random.choice([-1, 1], 84)
+        else:
+            spin_array = np.asarray(spin_array).copy()
+
+        if show:
+            plt.ion()
+
+        for id, temp in enumerate(self.T_global):
+            temp_ar = temp * (self.multiplier ** self.alpha)
+            avg_temp = np.mean(temp_ar)
+            beta = 1 / temp
+
+            ising = self.ising(temp_ar, Jij = self.Jij, beta = beta, spin_ar = spin_array.copy())
+            log = ising.simulate(steps, thermalization, log = True)
+            print(str(id) + ': ' + str(temp))
+            self.sim_dataset[id] = ising.generate_FC(partial)
+
+            self.avg_temp_ar.append(avg_temp)
+            self.ising_ar.append(log)
+            self.suscept_ar.append(ising.susceptibility(beta))
+            self.spec_heat_ar.append(ising.specific_heat(beta))
+
+            if show:
+                if temp != self.T_global[0]:
+                    plt.close()
+                figure, axis = ising.graph_everything(show=False)
+                figure.canvas.draw()
+                figure.canvas.flush_events()
+        if show:
+            plt.close()
+            plt.ioff()
+
+        crit_index = np.nanargmax(self.spec_heat_ar)
+        self.crit_temp = self.T_global[crit_index]
+        self.crit_ising = self.ising_ar[crit_index]
+        self.log = {'alpha': self.alpha,
+                    'multiplier': self.multiplier.tolist(),
+                    'min temp': self.T_global[0],
+                    'max temp': self.T_global[-1],
+                    'temp steps': np.size(self.T_global),
+                    'critical temperature': self.crit_temp,
+                    'mean critical temperature': np.mean((self.multiplier ** self.alpha) * self.crit_temp),
+                    'partial correlation': partial,
+                    'include diagonals': diag,
+                    'time scale': ising.__str__()}
+
+        print(self.log)
 
         if self.save:
-            pickle.dump(fig, open(f'{self.directory}/error_graph.fig.pickle', 'wb'))
+            save()
 
-        return fig
+    def correlate(self, emp_dataset):
+        self.temp_corr = np.zeros([np.size(self.T_global), np.uint8(len(emp_dataset))])
+        for sim_id in self.sim_dataset:
+            for emp_id in emp_dataset:
+                sim_FC = np.array(self.sim_dataset[sim_id]['matrix'])
+                emp_FC = np.array(emp_dataset[emp_id]['matrix'])
+                self.temp_corr[np.uint8(sim_id), np.uint8(emp_id)] = utils.mat_corr(sim_FC, emp_FC)
 
+        return self.temp_corr
 
-def plot_error(x_axis, y_axis, dataframe):
-    x_axis = 'params_' + x_axis
-    y_axis = 'params_' + y_axis
-    z = dataframe['value']
-    x = dataframe[x_axis]
-    y = dataframe[y_axis]
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_xlabel(x_axis)
-    ax.set_ylabel(y_axis)
-    ax.set_zlabel('value')
-    ax.scatter(x, y, z)
-    return fig
+    def graph_corr(self):
+        [temp, emp_FC] = np.shape(self.temp_corr)
+        for emp_id in range(emp_FC):
+            plt.plot(self.T_global, self.temp_corr[:, emp_id])
+        plt.xlabel('Global Temperature')
+        plt.ylabel('Correlation')
 
-
-def error_heatmap(x_axis, y_axis, dataframe, cmap = 'magma', log_x = False, log_y = False, ax = None):
-    # Create regular grid
-    x_axis = 'params_' + x_axis
-    y_axis = 'params_' + y_axis
-    z = dataframe['value']
-    x = dataframe[x_axis]
-    y = dataframe[y_axis]
-    nan_id = np.argwhere(np.isnan(z))
-    z = np.delete(z, nan_id)
-    x = np.delete(x, nan_id)
-    y = np.delete(y, nan_id)
-    # 2. Determine interpolation coordinates (always linear transformations)
-    x_interp = np.log10(x) if log_x else x
-    y_interp = np.log10(y) if log_y else y
-
-    # 3. Create a uniform evaluation grid based on interpolation spaces
-    xi_linear = np.linspace(x_interp.min(), x_interp.max(), 100)
-    yi_linear = np.linspace(y_interp.min(), y_interp.max(), 100)
-    Xi_linear, Yi_linear = np.meshgrid(xi_linear, yi_linear)
-
-    # 4. Perform the interpolation in linear-log math space
-    # (Using modern RBFInterpolator as sp.interpolate.Rbf is deprecated)
-    points = np.vstack([x_interp, y_interp]).T
-    rbf = sp.interpolate.RBFInterpolator(points, z, kernel='linear')
-
-    grid_points = np.vstack([Xi_linear.ravel(), Yi_linear.ravel()]).T
-    zi = rbf(grid_points).reshape(Xi_linear.shape)
-
-    # 5. Convert grid metrics back to raw scales for pcolormesh mapping
-    xi_raw = 10 ** Xi_linear if log_x else Xi_linear
-    yi_raw = 10 ** Yi_linear if log_y else Yi_linear
-
-    # 6. Plotting
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        fig.colorbar(ax)
-
-    hm = ax.pcolormesh(xi_raw, yi_raw, zi, cmap=cmap, shading='auto', norm=colors.LogNorm(vmin=z.min(), vmax=z.max()))
-    ax.scatter(x, y, color='white', edgecolor='black', s=20, label='Data Points')
-
-    # Apply log scaling to the axes visuals
-    if log_x:
-        ax.set_xscale('log')
-    if log_y:
-        ax.set_yscale('log')
-
-    # Careful: ax.set_aspect('equal') behaves unpredictably on log-scale axes
-    # It attempts to equalize raw data spans rather than visual screen inches.
-
-    ax.set_xlabel(x_axis)
-    ax.set_ylabel(y_axis)
-    return hm
-
-
-def error_multi_heatmap(dataframe, cmap = 'magma'):
-    fig, ax = plt.subplots(1, 4, width_ratios=[.48, .48, .48, .04])
-    ax0, ax1, ax2, ax_cb = ax
-    plt0 = error_heatmap('t_glob', 'alpha', dataframe, cmap = cmap, log_x = True, ax = ax0)
-    plt1 = error_heatmap('t_glob', 'thresh', dataframe, cmap = cmap, log_x = True, log_y = True, ax = ax1)
-    plt2 = error_heatmap('thresh', 'alpha', dataframe, cmap = cmap, log_x = True, ax = ax2)
-    fig.colorbar(plt0, cax = ax_cb)
-    return fig
-
-
-def load_3d_plots(directory, file_name):
-    plot = utils.get_pickle_file(directory, file_name)
-    plt.show()
-    return plot
+        plt.show()
 
 
 if __name__ == '__main__':
-    dataframe = pd.read_csv('E:\Python\GIM_FINAL\simulation data\optimization data\parameter optimization run 1_14_08_2026\log.csv')
-    heatmap = plot_error('alpha', 'thresh', dataframe)
-    plt.show()
+    steps = 4000
+    thermalization = 2000
+    min_temp = 0.05
+    max_temp = 10
+    temp_step = 100
+    alpha = 2
+    Jij = cf.avg_Jij * utils.get_sign_matrix(cf.avg_FC)
+    simulation = temp_sweep(min_temp, max_temp, temp_step, alpha, Jij = Jij, ising = I.Jij_sorted_ising)
+    simulation.simulate(steps, thermalization, partial = False, show = True)
+    simulation.graph_data(True)

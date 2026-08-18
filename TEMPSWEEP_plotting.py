@@ -15,7 +15,7 @@ SD_BAND = "#2CA25F"
 RED = "#E84855"
 AMBER = "#F4A261"
 
-
+## editing right now ...
 def run_sweep(t_min=0.05, t_max=10.0, t_steps=100, alpha=2.0,
               steps=4000, thermalization=2000):
     jij = np.asarray(cf.avg_Jij, dtype=float) * utils.get_sign_matrix(cf.avg_FC)

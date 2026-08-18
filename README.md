@@ -60,7 +60,7 @@ FINAL_GIM/
 
 If you use a different dataset, update the corresponding paths in `CONFIG.py` and ensure the replacement matrices have compatible dimensions. `FC_DATASET_PATH.json` contains dataset metadata; its paths must be changed if datasets are moved outside this repository.
 
-## Running the analyses
+## Running the analyses -- IGNORE FOR NOW AS IT IS ADDITIONAL TESTS
 
 From the repository root:
 
